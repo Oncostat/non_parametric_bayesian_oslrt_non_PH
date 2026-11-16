@@ -1,0 +1,329 @@
+library(nph)
+library(survival)
+#library(nphsim)
+#library(flexsurv)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(patchwork)
+library(lubridate)
+library(latex2exp)
+library(doParallel)
+library(foreach)
+library(doSNOW)
+
+rm(list = ls())
+
+weibull <- function(shape, median_surv, time){
+  stopifnot(length(median_surv)==(length(time)-1))
+  if((length(shape)==1) & (length(median_surv)>1)){
+    shape <- rep(shape, length(median_surv))
+  }
+  if(length(time)==2){
+    time <- c(time[1]:time[2])
+    haz <- shape*(log(2)/median_surv^shape)*time^(shape-1)
+    cumhaz <- log(2)*(time/median_surv)^shape
+    surv <- exp(-log(2)*(time/(median_surv*365))^shape)
+    F <- 1 - surv
+  }
+  else{
+    times <- c(0)
+    haz <- c(shape[1]*(log(2)/median_surv[1]^shape[1])*times^(shape[1]-1))
+    cumhaz <- c(log(2)*(times/median_surv[1])^shape[1])
+    surv <- c(exp(-log(2)*(times/(median_surv[1]*365))^shape[1]))
+    for(i in 1:(length(time)-1)){
+      t <- c((time[i]+1):time[i+1])
+      times <- c(times,t)
+      s <- shape[i]
+      m <- median_surv[i]
+      haz <- c(haz,s*(log(2)/m^s)*t^(s-1))
+      cumhaz <- c(cumhaz,log(2)*(t/m)^s)
+      surv <- c(surv,exp(-log(2)*(t/(m*365))^s))
+    }
+    F <- 1 - surv
+    time <- times
+  }
+  data.frame(t = time, hazard = haz, cum_hazard = cumhaz, surv = surv, F = F) 
+}
+
+
+################################################################################
+#################################Gamma Process##################################
+################################################################################
+
+GammaSampler <- R6::R6Class("GammaSampler", list(
+  
+  Dat = NA, # Data
+  Par = NA, #Parameters
+  Tim = NA, # Prespecfic time point
+  H = NA,
+  Surv = NA,
+  
+  initialize = function(L, R, Tim, size = 1000, c = 1) {
+    
+    self$Dat <- list(L=L, R=R, ind=which(L < R)) 
+    #ind = censored observations
+    # L = R corresponds to an observed event
+    
+    self$Par <- list(size = size, c = c, lambda = log(2)/median(L))
+    
+    self$Tim <- Tim
+  }, 
+  
+  ####  Possible based function
+  H0 = function(t, lambda){
+    lambda*t
+  },
+  
+  S0 = function(t, lambda){
+    exp(-self$H0(t, lambda = lambda))
+  },
+  
+  #### Sample an event time jump from the Kalbfleisch posterior
+  jump_sample = function(a, size){
+    z <- runif(size)
+    
+    A <- exp(log(a) + z*(log(a+1) - log(a)))
+    
+    U <- rexp(size, rate = A)
+    
+    return(U)
+  },
+  
+  #### Posterior sampling of H and S
+  
+  sample = function(){
+    c <- self$Par$c
+    size <- self$Par$size
+    lambda <- self$Par$lambda
+    
+    L <- self$Dat$L
+    R <- self$Dat$R
+    
+    ##Observed event times##
+    event <- (L == R)
+    event_times <- sort(unique(L[event]))
+    
+    d_event <- table(L[event])
+    
+    if(any(d_event > 1)){
+      stop("Tied event are not supported by this implementation of the Kalbfleisch Gamma Process.")
+    }
+    
+    grid <- sort(unique(c(0, self$Tim, L)))
+    
+    ng <- length(grid)
+    
+    H_grid <- matrix(0, nrow = ng, ncol = size)
+    
+    H_current <- numeric(size)
+    
+    for(j in 2:ng){
+      t_left <- grid[j-1]
+      t_right <- grid[j]
+      
+      Y <- sum(L >= t_left & R > t_left)
+      
+      dH0 <- self$H0(t_right, lambda = lambda) - self$H0(t_left, lambda = lambda)
+      
+      if(dH0 > 0){
+        dH <- rgamma(n = size, shape = c*dH0, rate = c+Y)
+        H_current <- H_current+dH
+      }
+      
+      is_event <- t_right %in% event_times
+      
+      if(is_event){
+        Y_event <- sum(L >= t_right)
+        jump <- self$jump_sample(a = c+Y_event, size = size)
+        
+        H_current <- H_current + jump
+      }
+      
+      H_grid[j, ] <- H_current
+    }
+    
+    tim_index <- match(self$Tim, grid)
+    
+    self$H <- H_grid[tim_index, , drop = FALSE]
+    
+    self$Surv <- exp(-self$H)
+    
+    invisible(self)
+  }
+))
+
+
+################################################################################
+#####################Delayed effect score test##################################
+################################################################################
+
+Score_DE <- function(time, event, CP, rate_exp, shape_weib, scale_weib, shape_llogis,
+                     scale_llogis, mean_lnorm, sd_lnorm, mu_gengamma,
+                     sigma_gengamma, Q_gengamma, distr, pi = 0){
+  data <- data.frame(t = time, e = event)
+  data2 <- arrange(data, t)
+  t_CP <- data2$t[which(data2$t>CP)]
+  O_CP <- data2$e[which(data2$t>CP)]
+  if(distr=='Exponential'){
+    S <- function(u, rate){1-pexp(u, rate)}
+    H <- function(u, rate){-log(S(u, rate))}
+    H0 <- H(t_CP, rate_exp)
+    H0_CP <- H(CP, rate_exp)
+  }
+  if(distr=='Weibull'){
+    S <- function(u, shape, scale){1-pweibull(u, shape, scale)}
+    H <- function(u, shape, scale){-log(S(u, shape, scale))}
+    H0 <- H(t_CP, shape_weib, scale_weib)
+    H0_CP <- H(CP, shape_weib, scale_weib)
+  }
+  if(distr=='Log-logistic'){
+    S <- function(u, shape, scale){1-pllogis(u, shape, scale)}
+    H <- function(u, shape, scale){-log(S(u, shape, scale))}
+    H0 <- H(t_CP, shape_llogis, scale_llogis)
+    H0_CP <- H(CP, shape_llogis, scale_llogis)
+  }
+  if(distr=='Log-normal'){
+    S <- function(u, mean, sd){1-plnorm(u, mean, sd)}
+    H <- function(u, mean, sd){-log(S(u, mean, sd))}
+    H0 <- H(t_CP, mean_lnorm, sd_lnorm)
+    H0_CP <- H(CP, mean_lnorm, sd_lnorm)
+  }
+  if(distr=='Gen Gamma'){
+    S <- function(u, mu, sigma, Q){1-pgengamma(u, mu, sigma, Q)}
+    H <- function(u, mu, sigma, Q){-log(S(u, mu, sigma, Q))}
+    H0 <-H(t_CP, mu_gengamma, sigma_gengamma, Q_gengamma)
+    H0_CP <- H(CP, mu_gengamma, sigma_gengamma, Q_gengamma)
+  }
+  H_tau <- rep(H0_CP, length(H0))
+  Obs <- O_CP-H0+H_tau
+  Num <- sum(Obs)
+  V <- H0 - H_tau
+  Var <- sum(V)
+  Z <- Num/sqrt(Var)
+  pval <- 1-pnorm(-Z)
+  return(c(Z, pval))
+}
+
+
+################################################################################
+#############Generation of experimental group under H0##########################
+################################################################################
+
+generate_exp <- function(sampling, s, nexp){
+  u <- runif(nexp)
+  Hs <- sampling$H[, s]
+  grid <- sampling$Tim
+  htarget <- -log(u)
+  keep <- !duplicated(Hs)
+  Tgen <- approx(x = Hs[keep], y = grid[keep], xout = htarget, method = 'linear', rule = 1)$y
+  return(Tgen)
+}
+
+build_exp <- function(Texp, Cexp, tau){
+  #C_clin <- sample(Cexp, size = length(Texp), replace = TRUE)
+  C_adm <- rep(tau, length(Texp))
+  #Cens <- pmin(C_clin, C_adm)
+  delta_exp <- as.numeric(!is.na(Texp) & Texp <= C_adm)
+  t_exp <- pmin(Texp, C_adm, na.rm = TRUE)
+  list(time = t_exp, status = delta_exp)
+}
+
+
+################################################################################
+########################Z_DE bayesian###########################################
+################################################################################
+
+DE_bayesian_unique <- function(sampling, CP, t_exp, delta_exp, s){
+  data <- data.frame(t = t_exp, e = delta_exp)
+  data2 <- arrange(data, t)
+  t_CP <- data2$t[which(data2$t>CP)]
+  delta_CP <- data2$e[which(data2$t>CP)]
+  
+  grid <- sort(unique(c(t_CP, CP)))
+  H_grid <- approx(x = sampling$Tim, y = sampling$H[, s], xout = grid, method = 'linear')$y
+  
+  H_DP <- H_grid[match(t_CP, grid)]  #H0 de Z_DE adapte au DP 
+  
+  H_DP_CP <- H_grid[match(CP, grid)]  #H0_CP de Z_DE adapte au DP
+  H_CP <- rep(H_DP_CP, length(t_CP))  #H_tau de Z_DE adapte au DP
+  
+  Num <- sum(delta_CP - H_DP + H_CP)
+  Var <- sum(H_DP- H_CP)
+  Z_DE <- Num/sqrt(Var)
+  return(Z_DE)
+}
+
+
+################################################################################
+##########################Simulate H0###########################################
+################################################################################
+
+simulate_Z <- function(sampling, Cexp, nexp, CP, tau, net){
+  B <- ncol(sampling$Tim)
+  Z_DE <- numeric(B*net)
+  idx <- 1
+  for(s in 1:B){
+    for(e in 1:net){
+      Texp <- generate_exp(sampling = sampling, s = s, nexp = nexp)
+      data_exp <- build_exp(Texp = Texp, Cexp = Cexp, tau = tau)
+      Z_DE[idx] <- DE_bayesian_unique(sampling = sampling, CP = CP, t_exp = data_exp$time, delta_exp = data_exp$status, s = s)
+      idx <- idx+1
+    }
+  }
+  return(Z_DE)
+}
+
+
+################################################################################
+######################Computation of pval#######################################
+################################################################################
+
+compute_pval <- function(sampling, T_exp_obs, delta_exp_obs, CP, rate_exp, shape_weib, scale_weib, shape_llogis,
+                         scale_llogis, mean_lnorm, sd_lnorm, mu_gengamma, sigma_gengamma, Q_gengamma, distr, tau, net){
+  Z_DE <- Score_DE(time = T_exp_obs, event = delta_exp_obs, CP = CP, rate_exp = rate_exp, shape_weib = shape_weib, 
+                   scale_weib = scale_weib, shape_llogis = shape_llogis, scale_llogis = scale_llogis, 
+                   mean_lnorm = mean_lnorm, sd_lnorm = sd_lnorm, mu_gengamma = mu_gengamma, sigma_gengamma = sigma_gengamma, 
+                   Q_gengamma = Q_gengamma, distr = distr)[1]
+  nexp <- length(T_exp_obs)
+  C_obs <- T_exp_obs[which(delta_exp_obs==0)]
+  Z_sim <- simulate_Z(sampling = sampling, Cexp = C_obs, nexp = nexp, CP = CP, tau = tau, net = net)
+  pvalue <- mean(Z_sim <= Z_DE)
+  return(pvalue)
+}
+
+################################################################################
+########################Parallelisation#########################################
+################################################################################
+
+one_sim <- function(i, nexp, shape0, scale0, CP_gen, CP, sampling_cont, len, shape1, scale1,
+                    ta, tf, lambda_cens, net){
+  set.seed(i)
+  
+  time <- rweibull(n = nexp, shape = shape1, scale = scale1)
+  #time <- nphsim::rpwexp(n = nexp, rate = c(1/scale0*1, 1/scale0*0.5), intervals = CP_gen, cumulative = FALSE)
+  u <- runif(n = nexp, min = 0, max = ta)
+  
+  if(lambda_cens==0){  #administrative censoring
+    del <- rep(1, nexp)
+    t <- pmin(time, ta+tf-u)
+    delta <- ifelse(time < ta+tf-u, del, 0)
+  }
+  else{   #lost during FU + administrative censoring
+    cens <- stats::rexp(nexp, lambda_cens)
+    time <- ifelse(time < cens, time, cens)
+    del <- ifelse(time < cens, 1, 0)
+    t <- pmin(time, ta+tf-u)
+    delta <- ifelse(time < ta+tf-u, del, 0)
+  }
+  
+  a <- Score_DE(time = t, event = delta, CP = CP, shape_weib = shape0, scale_weib = scale0, distr = 'Weibull')[2]
+  c <- compute_pval(sampling = sampling_cont, T_exp_obs = t, delta_exp_obs = delta, CP = CP, shape_weib = shape0, 
+                    scale_weib = scale0, distr = 'Weibull',tau = ta+tf, net = net)
+  
+  out <- data.frame(n_pat = nexp,
+                    n_evts = sum(delta),
+                    err_de = ifelse((a<0.05), 1, 0),
+                    err_bay_de = ifelse((c<0.05), 1, 0))
+  return(out)
+}
