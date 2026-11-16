@@ -1,0 +1,395 @@
+library(nph)
+library(survival)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(patchwork)
+library(lubridate)
+library(latex2exp)
+library(doParallel)
+library(foreach)
+library(doSNOW)
+
+rm(list = ls())
+
+rpwexp <- function(n, rate=1, intervals=NULL, cumulative=FALSE){
+  if(is.null(intervals)){
+    if (cumulative){return(cumsum(rexp(n,rate[1])))}else
+      return(rexp(n,rate[1]))}
+  k <- length(rate)
+  if (k==1){
+    if(cumulative){return(cumsum(rexp(n,rate)))}else
+      return(rexp(n,rate))
+  }
+  if (length(intervals) < k-1) stop("length(intervals) must be at least length(rate) - 1")
+  tx <- 0
+  j <- 1
+  times <- array(0,n)
+  timex <- cumsum(intervals)
+  indx <- array(TRUE,n)
+  for(i in 1:k){
+    nindx <- sum(indx)
+    if (nindx==0) break
+    increment <- rexp(nindx,rate[i])
+    if (cumulative) times[indx] <- tx + cumsum(increment)
+    else times[indx] <- tx + increment
+    if (i<k){
+      tx <- timex[i]
+      indx <- (times > timex[i])
+    }
+  }
+  return(times)
+}
+
+weibull <- function(shape, median_surv, time){
+  stopifnot(length(median_surv)==(length(time)-1))
+  if((length(shape)==1) & (length(median_surv)>1)){
+    shape <- rep(shape, length(median_surv))
+  }
+  if(length(time)==2){
+    time <- c(time[1]:time[2])
+    haz <- shape*(log(2)/median_surv^shape)*time^(shape-1)
+    cumhaz <- log(2)*(time/median_surv)^shape
+    surv <- exp(-log(2)*(time/(median_surv*365))^shape)
+    F <- 1 - surv
+  }
+  else{
+    times <- c(0)
+    haz <- c(shape[1]*(log(2)/median_surv[1]^shape[1])*times^(shape[1]-1))
+    cumhaz <- c(log(2)*(times/median_surv[1])^shape[1])
+    surv <- c(exp(-log(2)*(times/(median_surv[1]*365))^shape[1]))
+    for(i in 1:(length(time)-1)){
+      t <- c((time[i]+1):time[i+1])
+      times <- c(times,t)
+      s <- shape[i]
+      m <- median_surv[i]
+      haz <- c(haz,s*(log(2)/m^s)*t^(s-1))
+      cumhaz <- c(cumhaz,log(2)*(t/m)^s)
+      surv <- c(surv,exp(-log(2)*(t/(m*365))^s))
+    }
+    F <- 1 - surv
+    time <- times
+  }
+  data.frame(t = time, hazard = haz, cum_hazard = cumhaz, surv = surv, F = F) 
+}
+
+Sampler <- R6::R6Class("Sampler", list(
+  # the Gibbs sampler of the MDP posterior
+  Dat = NA, # Data
+  Par = NA, 
+  The = NA, # Theta
+  Tim = NA, # Prespecfic time point
+  
+  initialize = function(L, R, size=1000, M=0.001, a=0.001, b=0.001) {
+    # initialization
+    self$Dat <- list(L=L, R=R, ind=which(L < R)) # Generate time-to-event data
+    # If uncensored, L=X,R=X,index is not included in ind
+    # In censored, L=X,R=infty,index is included in ind
+    self$Par <- list(size=size, M=M, a=a, b=b)
+  }, 
+  
+  ####  Possible based function
+  G0_cdf = function(x, lambda) {
+    # modifiable
+    pexp(x, rate = lambda)
+  }, 
+  
+  G0_ppf = function(p, lambda) {
+    # modifiable
+    qexp(p, rate = lambda)
+  }, 
+  
+  G_cdf = function(x, the, lambda) {
+    # the cdf of the base distribution
+    1 - ((1 - self$G0_cdf(x = x, lambda = lambda))^the)
+  }, 
+  
+  G_ppf = function(p, the, lambda) {
+    # the ppf of the base distribution
+    self$G0_ppf(1 - ((1 - p)^(1 / the)), lambda = lambda)
+  }, 
+  
+  
+  # sample theta given T1,...,Tn
+  tim2the = function(tim, lambda) {
+    tim <- unique(tim)
+    a <- self$Par$a + length(tim)
+    b <- self$Par$b - sum(log(1 - self$G0_cdf(tim, lambda = lambda)))
+    return(rgamma(1, shape=a, rate=b))
+  }, 
+  
+  
+  # sample T1,...,Tn given theta
+  the2tim = function(the, tim, lambda) {
+    for (i in sample(self$Dat$ind)) {
+      # Compute \sum_{j\neq i} I(T_j\in\{L_i,R_i\})
+      flag <- (self$Dat$L[i] <= tim) & (tim <= self$Dat$R[i])
+      flag[i] <- F
+      # Compute F(R_i|theta)-F(L_i|theta)
+      pL <- self$G_cdf(self$Dat$L[i], the, lambda = lambda)
+      pR <- self$G_cdf(self$Dat$R[i], the, lambda = lambda)
+      prob <- pR - pL
+      # Compute Ti from MDP
+      prob <- c(self$Par$M * prob, 1 * flag)
+      prob <- prob / sum(prob)
+      choice <- sample(length(prob), 1, prob=prob)
+      if (choice == 1) {
+        # Sample from parametric part
+        tim[i] <- self$G_ppf(pL + runif(1) * (pR - pL), the, lambda = lambda)
+      } else {
+        # Sample from nonparametric part
+        tim[i] <- tim[choice - 1]
+      }
+    }
+    
+    tim
+  }, 
+  
+  gibbs = function(thin=1, burn=100, the=1.0) {
+    # (Initialization) impute the missing data by Gibbs
+    self$Dat$lambda <- log(2) / median(self$Dat$L)
+    pL <- self$G_cdf(self$Dat$L, the, lambda = self$Dat$lambda)
+    pR <- self$G_cdf(self$Dat$R, the, lambda = self$Dat$lambda)
+    tim <- self$G_ppf(pL + runif(length(pL)) * (pR - pL), the, lambda = self$Dat$lambda)
+    # Burn-in
+    for (b in 1:burn) {
+      the <- self$tim2the(tim, lambda = self$Dat$lambda)
+      tim <- self$the2tim(the, tim, lambda = self$Dat$lambda)
+    }
+    # Gibbs sampling of theta and T1,...,Tn
+    self$The <- rep(0.0, self$Par$size)
+    self$Tim <- matrix(0.0, length(tim), self$Par$size)
+    for (s in 1:self$Par$size) {
+      for (t in 1:thin) {
+        the <- self$tim2the(tim, lambda = self$Dat$lambda)
+        tim <- self$the2tim(the, tim, lambda = self$Dat$lambda)
+      }
+      self$The[s] <- the
+      self$Tim[, s] <- tim
+    }
+  }
+))
+
+dirichlet <- function(sampling, grid) {
+  # draw samples S(t) from the Dirichlet process
+  add <- F
+  if (grid[1] != 0.0) {
+    grid <- c(0.0, grid)
+    add <- T
+  }
+  # Algorithm 3
+  Sur <- matrix(0.0, length(grid), sampling$Par$size)
+  Sur[1, ] <- 1.0
+  a <- (sampling$Par$M + nrow(sampling$Tim)) * rep(1, sampling$Par$size)
+  for (j in 2:length(grid)) {
+    c_d <- a
+    a <- sampling$Par$M * (1 - sampling$G_cdf(grid[j], sampling$The, lambda = sampling$Dat$lambda)) + colSums(grid[j] < sampling$Tim)
+    flag <- a > 0
+    ratio <- rbeta(sum(flag), a[flag], c_d[flag] - a[flag])
+    Sur[j, flag] <- ratio * Sur[j - 1, flag]
+  }
+  if (add) {
+    Sur <- Sur[-1, ]
+  }
+  return(Sur)
+}
+
+dirichlet_unique <- function(sampling, s, grid) {
+  # draw samples S(t) from the Dirichlet process
+  add <- F
+  if (grid[1] != 0.0) {
+    grid <- c(0.0, grid)
+    add <- T
+  }
+  # Algorithm 3
+  Sur <- numeric(length(grid))
+  Sur[1] <- 1.0
+  a <- (sampling$Par$M + length(sampling$Tim[,s]))
+  for (j in 2:length(grid)) {
+    c <- a
+    a <- sampling$Par$M * (1 - sampling$G_cdf(grid[j], sampling$The[s], lambda = sampling$Dat$lambda)) + sum(grid[j] < sampling$Tim[,s])
+    flag <- a > 0
+    ratio <- rbeta(sum(flag), a[flag], c[flag] - a[flag])
+    Sur[j] <- ratio * Sur[j - 1]
+  }
+  if (add) {
+    Sur <- Sur[-1]
+  }
+  return(Sur)
+}
+
+
+################################################################################
+#####################Early effect score test####################################
+################################################################################
+
+Score_EE <- function(time, event, CP, rate_exp, shape_weib, scale_weib, shape_llogis,
+                     scale_llogis, mean_lnorm, sd_lnorm, mu_gengamma,
+                     sigma_gengamma, Q_gengamma, distr){
+  data <- data.frame(t = time, e = event)
+  data2 <- dplyr::arrange(data, t)
+  t_CP <- data2$t[which(data2$t<=CP)]
+  O_CP <- data2$e[which(data2$t<=CP)]
+  if(distr=='Exponential'){
+    S <- function(u, rate){1-pexp(u, rate)}
+    H <- function(u, rate){-log(S(u, rate))}
+    H0 <- H(t_CP, rate_exp)
+    H0_CP <- H(CP, rate_exp)
+  }
+  if(distr=='Weibull'){
+    S <- function(u, shape, scale){1-pweibull(u, shape, scale)}
+    H <- function(u, shape, scale){-log(S(u, shape, scale))}
+    H0 <- H(t_CP, shape_weib, scale_weib)
+    H0_CP <- H(CP, shape_weib, scale_weib)
+  }
+  if(distr=='Log-logistic'){
+    S <- function(u, shape, scale){1-pllogis(u, shape, scale)}
+    H <- function(u, shape, scale){-log(S(u, shape, scale))}
+    H0 <- H(t_CP, shape_llogis, scale_llogis)
+    H0_CP <- H(CP, shape_llogis, scale_llogis)
+  }
+  if(distr=='Log-normal'){
+    S <- function(u, mean, sd){1-plnorm(u, mean, sd)}
+    H <- function(u, mean, sd){-log(S(u, mean, sd))}
+    H0 <- H(t_CP, mean_lnorm, sd_lnorm)
+    H0_CP <- H(CP, mean_lnorm, sd_lnorm)
+  }
+  if(distr=='Gen Gamma'){
+    S <- function(u, mu, sigma, Q){1-pgengamma(u, mu, sigma, Q)}
+    H <- function(u, mu, sigma, Q){-log(S(u, mu, sigma, Q))}
+    H0 <-H(t_CP, mu_gengamma, sigma_gengamma, Q_gengamma)
+    H0_CP <- H(CP, mu_gengamma, sigma_gengamma, Q_gengamma)
+  }
+  H_tau2 <- rep(H0_CP, length(data2$t[which(data2$t>=CP)]))
+  H_tau <- sum(H_tau2)
+  Obs <- O_CP-H0
+  Num <- sum(Obs)-H_tau
+  Var <- sum(H0)+H_tau
+  Z  <- Num/sqrt(Var)
+  pval <- 1-pnorm(-Z)
+  return(c(Z, pval))
+}
+
+
+################################################################################
+#############Generation of experimental group under H0##########################
+################################################################################
+
+generate_exp <- function(sampling, s, nexp){
+  the_s <- sampling$The[s]
+  u <- runif(nexp)
+  Tgen <- sampling$G_ppf(u, the_s, sampling$Dat$lambda)
+  return(Tgen)
+}
+
+build_exp <- function(Texp, Cexp, tau){
+  #C_clin <- sample(Cexp, size = length(Texp), replace = TRUE)
+  C_adm <- rep(tau, length(Texp))
+  #Cens <- pmin(C_clin, C_adm)
+  t_exp <- pmin(Texp, C_adm)
+  delta_exp <- as.numeric(Texp <= C_adm)
+  list(time = t_exp, status = delta_exp)
+}
+
+################################################################################
+########################Z_EE bayesian###########################################
+################################################################################
+
+
+EE_bayesian_unique <- function(sampling, CP, t_exp, delta_exp, s){
+  data <- data.frame(t = t_exp, e = delta_exp)
+  data2 <- dplyr::arrange(data, t)
+  t_CP <- data2$t[which(data2$t<=CP)]
+  delta_CP <- data2$e[which(data2$t<=CP)]
+  
+  grid <- sort(unique(c(t_CP, CP)))
+  S_grid <- dirichlet_unique(sampling = sampling, s = s, grid = grid)
+  
+  S_DP <- S_grid[match(t_CP, grid)]
+  H_DP <- -log(S_DP)  #H0 de Z_EE adapte au DP  
+  
+
+  S_DP_CP <- S_grid[match(CP, grid)]
+  H_DP_CP <- -log(S_DP_CP)  #H0_CP de Z_EE adapte au DP
+  H_CP <- sum(rep(H_DP_CP, length(data2$t[which(data2$t>=CP)])))  #H_tau de Z_EE adapte au DP
+  
+  Obs <- delta_CP - H_DP
+  Num <- sum(Obs) - H_CP
+  Var <- sum(H_DP) + H_CP
+  Z_EE <- Num/sqrt(Var)
+  return(Z_EE)
+}
+
+
+################################################################################
+##########################Simulate H0###########################################
+################################################################################
+
+simulate_Z <- function(sampling, Cexp, nexp, CP, tau, net){
+  B <- ncol(sampling$Tim)
+  Z_EE <- numeric(B*net)
+  idx <- 1
+  for(s in 1:B){
+    for(e in 1:net){
+      Texp <- generate_exp(sampling = sampling, s = s, nexp = nexp)
+      data_exp <- build_exp(Texp = Texp, Cexp = Cexp, tau = tau)
+      Z_EE[idx] <- EE_bayesian_unique(sampling = sampling, CP = CP, t_exp = data_exp$time, delta_exp = data_exp$status, s = s)
+      idx <- idx+1
+    }
+  }
+  return(Z_EE)
+}
+
+
+################################################################################
+######################Computation of pval#######################################
+################################################################################
+
+compute_pval <- function(sampling, T_exp_obs, delta_exp_obs, CP, rate_exp, shape_weib, scale_weib, shape_llogis,
+                         scale_llogis, mean_lnorm, sd_lnorm, mu_gengamma, sigma_gengamma, Q_gengamma, distr, tau, net){
+  Z_EE <- Score_EE(time = T_exp_obs, event = delta_exp_obs, CP = CP, rate_exp = rate_exp, shape_weib = shape_weib, 
+                   scale_weib = scale_weib, shape_llogis = shape_llogis, scale_llogis = scale_llogis, 
+                   mean_lnorm = mean_lnorm, sd_lnorm = sd_lnorm, mu_gengamma = mu_gengamma, sigma_gengamma = sigma_gengamma, 
+                   Q_gengamma = Q_gengamma, distr = distr)[1]
+  nexp <- length(T_exp_obs)
+  C_obs <- T_exp_obs[which(delta_exp_obs==0)]
+  Z_sim <- simulate_Z(sampling = sampling, Cexp = C_obs, nexp = nexp, CP = CP, tau = tau, net = net)
+  pvalue <- mean(Z_sim <= Z_EE)
+  return(bee = pvalue)
+}
+
+################################################################################
+########################Parallelisation#########################################
+################################################################################
+
+one_sim <- function(i, nexp, shape0, scale0, CP_gen, CP, sampling_cont, len, shape1, scale1,
+                    ta, tf, lambda_cens, net){
+  set.seed(i)
+  
+  #time <- rweibull(n = nexp, shape = shape1, scale = scale1)
+  time <- rpwexp(n = nexp, rate = c(1/scale0*0.5, 1/scale0*1), intervals = CP_gen, cumulative = FALSE)
+  u <- runif(n = nexp, min = 0, max = ta)
+  
+  if(lambda_cens==0){  #administrative censoring
+    del <- rep(1, nexp)
+    t <- pmin(time, ta+tf-u)
+    delta <- ifelse(time < ta+tf-u, del, 0)
+  }
+  else{   #lost during FU + administrative censoring
+    cens <- stats::rexp(nexp, lambda_cens)
+    time <- ifelse(time < cens, time, cens)
+    del <- ifelse(time < cens, 1, 0)
+    t <- pmin(time, ta+tf-u)
+    delta <- ifelse(time < ta+tf-u, del, 0)
+  }
+  
+  a <- Score_EE(time = t, event = delta, CP = CP, shape_weib = shape0, scale_weib = scale0, distr = 'Weibull')[2]
+  c <- compute_pval(sampling = sampling_cont, T_exp_obs = t, delta_exp_obs = delta, CP = CP, shape_weib = shape0, 
+                    scale_weib = scale0, distr = 'Weibull',tau = ta+tf, net = net)
+  
+  out <- data.frame(n_pat = nexp,
+                    n_evts = sum(delta),
+                    err_ee = ifelse((a<0.05), 1, 0),
+                    err_bay_ee = ifelse((c<0.05), 1, 0))
+  return(out)
+}
